@@ -1,0 +1,16 @@
+{
+  "name": "jerusalem-rent-finder",
+  "version": "1.0.0",
+  "description": "Apartment rental finder for Jerusalem - aggregates listings from Yad2 and Facebook onto Google Maps",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently \"npm run dev:server\" \"npm run dev:client\"",
+    "dev:client": "cd client && npm run dev",
+    "dev:server": "cd server && npm run dev",
+    "build": "cd client && npm run build",
+    "install:all": "npm install && cd client && npm install && cd ../server && npm install"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
