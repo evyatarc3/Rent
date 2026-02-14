@@ -1,10 +1,49 @@
-import axios from 'axios';
+import puppeteer, { type Browser, type Page } from 'puppeteer-core';
 import { Listing } from '../db/database';
 import { geocodeAddress } from '../services/geocoding';
+import { execSync } from 'child_process';
+import path from 'path';
+import fs from 'fs';
 
-const YAD2_BASE_URL = 'https://www.yad2.co.il/realestate/rent';
+const YAD2_RENT_URL = 'https://www.yad2.co.il/realestate/rent';
 
-// ── Yad2 Next.js SSR data interfaces ──
+// ── Find Chrome on user's system ──
+
+function findChromePath(): string {
+  const possiblePaths = [
+    // macOS
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+    '/Applications/Chromium.app/Contents/MacOS/Chromium',
+    '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
+    // Linux
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium',
+    '/snap/bin/chromium',
+    // Windows (WSL/common)
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+  ];
+
+  for (const p of possiblePaths) {
+    try {
+      if (fs.existsSync(p)) return p;
+    } catch {}
+  }
+
+  // Try to find via `which`
+  try {
+    const found = execSync('which google-chrome || which chromium-browser || which chromium 2>/dev/null', { encoding: 'utf8' }).trim();
+    if (found) return found;
+  } catch {}
+
+  throw new Error(
+    '[Yad2] Chrome/Chromium not found. Install Google Chrome or set CHROME_PATH environment variable.'
+  );
+}
+
+// ── Yad2 data interfaces (from __NEXT_DATA__) ──
 
 interface Yad2Address {
   region?: { text: string };
@@ -16,36 +55,21 @@ interface Yad2Address {
   coords?: { lat: number; lon: number };
 }
 
-interface Yad2AdditionalDetails {
-  property?: { text: string };
-  roomsCount?: number;
-  squareMeter?: number;
-  propertyCondition?: { id: number };
-}
-
-interface Yad2MetaData {
-  coverImage?: string;
-  images?: string[];
-}
-
-interface Yad2Tag {
-  name: string;
-  id: number;
-  priority: number;
-}
-
 interface Yad2FeedItem {
   address: Yad2Address;
-  subcategoryId?: number;
-  categoryId?: number;
   adType?: string;
   price?: number;
   token: string;
-  additionalDetails?: Yad2AdditionalDetails;
-  metaData?: Yad2MetaData;
-  tags?: Yad2Tag[];
-  orderId?: number;
-  priority?: number;
+  additionalDetails?: {
+    property?: { text: string };
+    roomsCount?: number;
+    squareMeter?: number;
+  };
+  metaData?: {
+    coverImage?: string;
+    images?: string[];
+  };
+  tags?: { name: string }[];
   [key: string]: any;
 }
 
@@ -59,7 +83,6 @@ interface Yad2FeedData {
   booster?: Yad2FeedItem[];
   leadingBroker?: Yad2FeedItem[];
   pagination?: { total: number; totalPages: number };
-  lookalike?: Yad2FeedItem[];
 }
 
 // ── Conversion helpers ──
@@ -74,16 +97,15 @@ function buildAddress(addr: Yad2Address): string {
 }
 
 function feedItemToListing(item: Yad2FeedItem): Listing | null {
-  const addr = item.address || {};
+  const addr = item.address || ({} as Yad2Address);
   const address = buildAddress(addr);
   const price = item.price;
   const rooms = item.additionalDetails?.roomsCount;
 
-  // Must have at least address, price, and rooms
-  if (!address || !price || price <= 0 || !rooms || rooms <= 0) return null;
+  if (!address || !price || price <= 0) return null;
 
   const imageUrl =
-    item.metaData?.coverImage || (item.metaData?.images && item.metaData.images[0]);
+    item.metaData?.coverImage || item.metaData?.images?.[0];
 
   const propertyType = item.additionalDetails?.property?.text || '';
   const tags = (item.tags || []).map((t) => t.name).join(', ');
@@ -99,10 +121,10 @@ function feedItemToListing(item: Yad2FeedItem): Listing | null {
     neighborhood: addr.neighborhood?.text || undefined,
     city: addr.city?.text || 'ירושלים',
     price,
-    rooms,
+    rooms: rooms || 0,
     floor: addr.house?.floor ?? undefined,
     size_sqm: item.additionalDetails?.squareMeter ?? undefined,
-    contact_info: `yad2.co.il/item/${item.token}`,
+    contact_info: `https://www.yad2.co.il/item/${item.token}`,
     description,
     image_url: imageUrl || undefined,
     source_url: `https://www.yad2.co.il/item/${item.token}`,
@@ -111,44 +133,36 @@ function feedItemToListing(item: Yad2FeedItem): Listing | null {
   };
 }
 
-// ── HTML parsing: extract __NEXT_DATA__ ──
+// ── Extract feed data from page via Puppeteer ──
 
-function extractNextData(html: string): any | null {
-  // Look for the __NEXT_DATA__ script tag
-  const marker = '<script id="__NEXT_DATA__" type="application/json">';
-  const startIdx = html.indexOf(marker);
-  if (startIdx === -1) {
-    console.warn('[Yad2] Could not find __NEXT_DATA__ in HTML');
-    return null;
-  }
-
-  const jsonStart = startIdx + marker.length;
-  const jsonEnd = html.indexOf('</script>', jsonStart);
-  if (jsonEnd === -1) {
-    console.warn('[Yad2] Could not find closing </script> for __NEXT_DATA__');
-    return null;
-  }
-
+async function extractFeedFromPage(page: Page): Promise<Yad2FeedData | null> {
   try {
-    return JSON.parse(html.substring(jsonStart, jsonEnd));
+    const feedData = await page.evaluate(() => {
+      const el = document.getElementById('__NEXT_DATA__');
+      if (!el) return null;
+
+      try {
+        const nextData = JSON.parse(el.textContent || '');
+        const queries = nextData?.props?.pageProps?.dehydratedState?.queries;
+        if (!Array.isArray(queries)) return null;
+
+        for (const q of queries) {
+          const key = JSON.stringify(q.queryKey || '');
+          if (key.includes('realestate-rent-feed')) {
+            return q.state?.data || null;
+          }
+        }
+      } catch {
+        return null;
+      }
+      return null;
+    });
+
+    return feedData as Yad2FeedData | null;
   } catch (e: any) {
-    console.error('[Yad2] Failed to parse __NEXT_DATA__ JSON:', e.message);
+    console.error('[Yad2] Error extracting feed from page:', e.message);
     return null;
   }
-}
-
-function extractFeedFromNextData(nextData: any): Yad2FeedData | null {
-  const queries = nextData?.props?.pageProps?.dehydratedState?.queries;
-  if (!Array.isArray(queries)) return null;
-
-  for (const q of queries) {
-    const key = JSON.stringify(q.queryKey || '');
-    if (key.includes('realestate-rent-feed')) {
-      return q.state?.data as Yad2FeedData;
-    }
-  }
-
-  return null;
 }
 
 // ── Main scraper ──
@@ -160,116 +174,129 @@ export async function scrapeYad2(
   const allListings: Listing[] = [];
   const seenTokens = new Set<string>();
 
+  const chromePath = process.env.CHROME_PATH || findChromePath();
+  console.log(`[Yad2] Using Chrome at: ${chromePath}`);
   console.log(`[Yad2] Starting scrape for Jerusalem rentals (${pages} pages)...`);
 
-  for (let page = 1; page <= pages; page++) {
-    try {
-      console.log(`[Yad2] Fetching page ${page}/${pages}...`);
+  let browser: Browser | null = null;
 
-      const url = `${YAD2_BASE_URL}?city=3000&page=${page}`;
-      const response = await axios.get(url, {
-        headers: {
-          Accept:
-            'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7',
-          'User-Agent':
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-          'Cache-Control': 'no-cache',
-        },
-        timeout: 20000,
-        maxRedirects: 5,
-      });
+  try {
+    browser = await puppeteer.launch({
+      executablePath: chromePath,
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--window-size=1920,1080',
+      ],
+    });
 
-      const html: string = response.data;
-      const nextData = extractNextData(html);
-      if (!nextData) {
-        console.warn(`[Yad2] Page ${page}: No __NEXT_DATA__ found, skipping`);
-        continue;
-      }
+    const page = await browser.newPage();
 
-      const feed = extractFeedFromNextData(nextData);
-      if (!feed) {
-        console.warn(`[Yad2] Page ${page}: No feed data found in __NEXT_DATA__`);
-        continue;
-      }
+    // Set a realistic viewport and user agent
+    await page.setViewport({ width: 1920, height: 1080 });
+    await page.setUserAgent(
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+    );
 
-      if (page === 1 && feed.pagination) {
-        console.log(
-          `[Yad2] Total listings available: ${feed.pagination.total} across ${feed.pagination.totalPages} pages`
-        );
-      }
+    // Set Hebrew language
+    await page.setExtraHTTPHeaders({
+      'Accept-Language': 'he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7',
+    });
 
-      // Collect items from all feed categories
-      const categories: (keyof Yad2FeedData)[] = [
-        'private',
-        'agency',
-        'yad1',
-        'platinum',
-        'trio',
-        'booster',
-        'leadingBroker',
-        'kingOfTheHar',
-      ];
+    for (let pageNum = 1; pageNum <= pages; pageNum++) {
+      try {
+        const url = `${YAD2_RENT_URL}?city=3000&page=${pageNum}`;
+        console.log(`[Yad2] Fetching page ${pageNum}/${pages}: ${url}`);
 
-      let pageCount = 0;
-      for (const cat of categories) {
-        const items = feed[cat];
-        if (!Array.isArray(items)) continue;
+        await page.goto(url, {
+          waitUntil: 'networkidle2',
+          timeout: 30000,
+        });
 
-        for (const item of items as Yad2FeedItem[]) {
-          if (!item.token || seenTokens.has(item.token)) continue;
-          seenTokens.add(item.token);
+        // Wait a moment for any dynamic content
+        await new Promise((r) => setTimeout(r, 2000));
 
-          const listing = feedItemToListing(item);
-          if (listing) {
-            allListings.push(listing);
-            pageCount++;
+        const feed = await extractFeedFromPage(page);
+        if (!feed) {
+          console.warn(`[Yad2] Page ${pageNum}: No feed data found`);
+          // Take a screenshot for debugging
+          const screenshotPath = path.join(__dirname, '..', '..', 'data', `debug-page${pageNum}.png`);
+          try {
+            const dataDir = path.dirname(screenshotPath);
+            if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+            await page.screenshot({ path: screenshotPath });
+            console.log(`[Yad2] Debug screenshot saved: ${screenshotPath}`);
+          } catch {}
+          continue;
+        }
+
+        if (pageNum === 1 && feed.pagination) {
+          console.log(
+            `[Yad2] Total: ${feed.pagination.total} listings across ${feed.pagination.totalPages} pages`
+          );
+        }
+
+        // Collect from all categories
+        const categories: (keyof Yad2FeedData)[] = [
+          'private', 'agency', 'yad1', 'platinum',
+          'trio', 'booster', 'leadingBroker', 'kingOfTheHar',
+        ];
+
+        let pageCount = 0;
+        for (const cat of categories) {
+          const items = feed[cat];
+          if (!Array.isArray(items)) continue;
+
+          for (const item of items as Yad2FeedItem[]) {
+            if (!item.token || seenTokens.has(item.token)) continue;
+            seenTokens.add(item.token);
+
+            const listing = feedItemToListing(item);
+            if (listing) {
+              allListings.push(listing);
+              pageCount++;
+            }
           }
         }
-      }
 
-      console.log(
-        `[Yad2] Page ${page}: ${pageCount} new listings (${allListings.length} total)`
-      );
-
-      // Respect rate limits between pages
-      if (page < pages) {
-        await new Promise((r) => setTimeout(r, 2500));
-      }
-    } catch (error: any) {
-      if (error.response) {
-        console.error(
-          `[Yad2] Error page ${page}: HTTP ${error.response.status} - ${error.response.statusText}`
+        console.log(
+          `[Yad2] Page ${pageNum}: ${pageCount} new listings (${allListings.length} total)`
         );
-      } else {
-        console.error(`[Yad2] Error page ${page}:`, error.message);
+
+        // Rate limit between pages
+        if (pageNum < pages) {
+          await new Promise((r) => setTimeout(r, 3000));
+        }
+      } catch (error: any) {
+        console.error(`[Yad2] Error on page ${pageNum}:`, error.message);
       }
-      // Continue to next page on error
+    }
+  } catch (error: any) {
+    console.error('[Yad2] Browser error:', error.message);
+  } finally {
+    if (browser) {
+      try { await browser.close(); } catch {}
     }
   }
 
-  // Geocode listings that don't already have coordinates from Yad2
+  // Geocode listings without coordinates (most Yad2 listings already have coords)
   if (geocode) {
     const needGeocode = allListings.filter((l) => !l.lat || !l.lng);
     if (needGeocode.length > 0) {
-      console.log(
-        `[Yad2] Geocoding ${needGeocode.length} listings without coordinates...`
-      );
+      console.log(`[Yad2] Geocoding ${needGeocode.length} listings without coordinates...`);
       for (const listing of needGeocode) {
         try {
-          const coords = await geocodeAddress(
-            `${listing.address}, ירושלים, ישראל`
-          );
+          const coords = await geocodeAddress(`${listing.address}, ירושלים, ישראל`);
           if (coords) {
             listing.lat = coords.lat;
             listing.lng = coords.lng;
           }
           await new Promise((r) => setTimeout(r, 250));
         } catch (e: any) {
-          console.warn(
-            `[Yad2] Geocoding failed for: ${listing.address}`,
-            e.message
-          );
+          console.warn(`[Yad2] Geocoding failed for: ${listing.address}`, e.message);
         }
       }
     }
