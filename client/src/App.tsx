@@ -6,9 +6,6 @@ import { fetchListings, removeListing, scrapeYad2 } from './services/api';
 import { Listing, ListingFilters } from './types/listing';
 import './App.css';
 
-// Google Maps API key - set via environment variable
-const GOOGLE_MAPS_API_KEY = import.meta.env.VITE_GOOGLE_MAPS_API_KEY || '';
-
 export default function App() {
   const [listings, setListings] = useState<Listing[]>([]);
   const [filters, setFilters] = useState<ListingFilters>({});
@@ -64,40 +61,6 @@ export default function App() {
     }
   };
 
-  if (!GOOGLE_MAPS_API_KEY) {
-    return (
-      <div className="setup-screen">
-        <div className="setup-card">
-          <h1>🏠 מוצא דירה - ירושלים</h1>
-          <h2>הגדרה ראשונית</h2>
-          <p>כדי להשתמש באפליקציה, צריך מפתח Google Maps API.</p>
-          <div className="setup-steps">
-            <h3>שלבים:</h3>
-            <ol>
-              <li>
-                היכנס ל-
-                <a href="https://console.cloud.google.com/google/maps-apis" target="_blank" rel="noopener noreferrer">
-                  Google Cloud Console
-                </a>
-              </li>
-              <li>צור פרויקט חדש (או השתמש בקיים)</li>
-              <li>הפעל את Maps JavaScript API ו-Geocoding API</li>
-              <li>צור מפתח API</li>
-              <li>
-                צור קובץ <code>.env</code> בתיקיית <code>client/</code> עם:
-                <pre>VITE_GOOGLE_MAPS_API_KEY=your_key_here</pre>
-              </li>
-              <li>הפעל מחדש את השרת</li>
-            </ol>
-          </div>
-          <p className="setup-note">
-            💡 אפשר גם להגדיר <code>GOOGLE_MAPS_API_KEY</code> בתיקיית <code>server/.env</code> לשיפור ה-geocoding.
-          </p>
-        </div>
-      </div>
-    );
-  }
-
   return (
     <div className="app">
       <Sidebar
@@ -134,7 +97,6 @@ export default function App() {
           listings={listings}
           selectedListing={selectedListing}
           onSelectListing={setSelectedListing}
-          apiKey={GOOGLE_MAPS_API_KEY}
         />
       </main>
 
