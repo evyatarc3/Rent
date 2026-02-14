@@ -7,21 +7,22 @@ import fs from 'fs';
 
 const YAD2_RENT_URL = 'https://www.yad2.co.il/realestate/rent';
 
+// Persistent Chrome profile directory — cookies survive between runs
+// so the user only needs to solve captcha ONCE
+const CHROME_PROFILE_DIR = path.join(__dirname, '..', '..', 'data', 'chrome-profile');
+
 // ── Find Chrome on user's system ──
 
 function findChromePath(): string {
   const possiblePaths = [
-    // macOS
     '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
     '/Applications/Chromium.app/Contents/MacOS/Chromium',
     '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
-    // Linux
     '/usr/bin/google-chrome',
     '/usr/bin/google-chrome-stable',
     '/usr/bin/chromium-browser',
     '/usr/bin/chromium',
     '/snap/bin/chromium',
-    // Windows (WSL/common)
     'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
     'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
   ];
@@ -32,18 +33,15 @@ function findChromePath(): string {
     } catch {}
   }
 
-  // Try to find via `which`
   try {
     const found = execSync('which google-chrome || which chromium-browser || which chromium 2>/dev/null', { encoding: 'utf8' }).trim();
     if (found) return found;
   } catch {}
 
-  throw new Error(
-    '[Yad2] Chrome/Chromium not found. Install Google Chrome or set CHROME_PATH environment variable.'
-  );
+  throw new Error('[Yad2] Chrome not found. Install Google Chrome or set CHROME_PATH env var.');
 }
 
-// ── Yad2 data interfaces (from __NEXT_DATA__) ──
+// ── Yad2 data interfaces ──
 
 interface Yad2Address {
   region?: { text: string };
@@ -104,9 +102,7 @@ function feedItemToListing(item: Yad2FeedItem): Listing | null {
 
   if (!address || !price || price <= 0) return null;
 
-  const imageUrl =
-    item.metaData?.coverImage || item.metaData?.images?.[0];
-
+  const imageUrl = item.metaData?.coverImage || item.metaData?.images?.[0];
   const propertyType = item.additionalDetails?.property?.text || '';
   const tags = (item.tags || []).map((t) => t.name).join(', ');
   const description = [propertyType, tags].filter(Boolean).join(' | ') || undefined;
@@ -133,34 +129,93 @@ function feedItemToListing(item: Yad2FeedItem): Listing | null {
   };
 }
 
-// ── Extract feed data from page via Puppeteer ──
+// ── Anti-detection stealth ──
+
+async function applyStealthToPage(page: Page): Promise<void> {
+  await page.evaluateOnNewDocument(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => false });
+    (window as any).chrome = { runtime: {}, loadTimes: () => {}, csi: () => {}, app: {} };
+    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+    Object.defineProperty(navigator, 'languages', { get: () => ['he-IL', 'he', 'en-US', 'en'] });
+  });
+}
+
+// ── Check if page has captcha ──
+
+async function hasCaptcha(page: Page): Promise<boolean> {
+  return page.evaluate(() => {
+    const text = document.body?.innerText || '';
+    return text.includes('Are you for real') || text.includes('captcha') ||
+      !!document.querySelector('iframe[src*="hcaptcha"]') ||
+      !!document.querySelector('.captcha');
+  });
+}
+
+// ── Wait for user to solve captcha ──
+
+async function waitForCaptchaSolved(page: Page): Promise<void> {
+  console.log('[Yad2] ⚠️  CAPTCHA detected! A Chrome window should be open.');
+  console.log('[Yad2] ⚠️  Please solve the captcha in the browser window, then the scraping will continue automatically.');
+  console.log('[Yad2] ⏳ Waiting for captcha to be solved (up to 2 minutes)...');
+
+  const startTime = Date.now();
+  const timeout = 120000; // 2 minutes
+
+  while (Date.now() - startTime < timeout) {
+    await new Promise((r) => setTimeout(r, 2000));
+
+    const stillCaptcha = await hasCaptcha(page);
+    if (!stillCaptcha) {
+      console.log('[Yad2] ✅ Captcha solved! Continuing scraping...');
+      // Wait a bit more for the page to fully load after captcha
+      await new Promise((r) => setTimeout(r, 3000));
+      return;
+    }
+
+    const elapsed = Math.round((Date.now() - startTime) / 1000);
+    if (elapsed % 10 === 0) {
+      console.log(`[Yad2] ⏳ Still waiting for captcha... (${elapsed}s)`);
+    }
+  }
+
+  throw new Error('Captcha was not solved within 2 minutes');
+}
+
+// ── Extract feed data from page ──
 
 async function extractFeedFromPage(page: Page): Promise<Yad2FeedData | null> {
   try {
-    const feedData = await page.evaluate(() => {
+    const result = await page.evaluate(() => {
       const el = document.getElementById('__NEXT_DATA__');
-      if (!el) return null;
-
+      if (!el) {
+        return { error: 'no_next_data', title: document.title, url: window.location.href };
+      }
       try {
         const nextData = JSON.parse(el.textContent || '');
         const queries = nextData?.props?.pageProps?.dehydratedState?.queries;
-        if (!Array.isArray(queries)) return null;
+        if (!Array.isArray(queries)) return { error: 'no_queries' };
 
         for (const q of queries) {
           const key = JSON.stringify(q.queryKey || '');
           if (key.includes('realestate-rent-feed')) {
-            return q.state?.data || null;
+            return { feed: q.state?.data || null };
           }
         }
-      } catch {
-        return null;
+        return { error: 'no_feed_query' };
+      } catch (e: any) {
+        return { error: 'parse_error', message: e.message };
       }
-      return null;
     });
 
-    return feedData as Yad2FeedData | null;
+    if (result && 'feed' in result && result.feed) {
+      return result.feed as Yad2FeedData;
+    }
+    if (result && 'error' in result) {
+      console.warn(`[Yad2] Page debug:`, JSON.stringify(result));
+    }
+    return null;
   } catch (e: any) {
-    console.error('[Yad2] Error extracting feed from page:', e.message);
+    console.error('[Yad2] Error extracting feed:', e.message);
     return null;
   }
 }
@@ -178,33 +233,43 @@ export async function scrapeYad2(
   console.log(`[Yad2] Using Chrome at: ${chromePath}`);
   console.log(`[Yad2] Starting scrape for Jerusalem rentals (${pages} pages)...`);
 
+  // Ensure Chrome profile directory exists
+  if (!fs.existsSync(CHROME_PROFILE_DIR)) {
+    fs.mkdirSync(CHROME_PROFILE_DIR, { recursive: true });
+  }
+
   let browser: Browser | null = null;
 
   try {
+    // Launch Chrome in VISIBLE mode (not headless) so user can solve captcha if needed
+    // Uses a persistent profile so captcha cookies are saved between runs
     browser = await puppeteer.launch({
       executablePath: chromePath,
-      headless: true,
+      headless: false, // VISIBLE — user needs to solve captcha
+      userDataDir: CHROME_PROFILE_DIR, // persistent cookies
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
-        '--disable-gpu',
-        '--window-size=1920,1080',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-infobars',
+        '--window-size=1280,900',
+        '--lang=he-IL',
       ],
+      defaultViewport: { width: 1280, height: 900 },
     });
 
     const page = await browser.newPage();
+    await applyStealthToPage(page);
 
-    // Set a realistic viewport and user agent
-    await page.setViewport({ width: 1920, height: 1080 });
     await page.setUserAgent(
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
     );
-
-    // Set Hebrew language
     await page.setExtraHTTPHeaders({
       'Accept-Language': 'he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7',
     });
+
+    let captchaSolvedOnce = false;
 
     for (let pageNum = 1; pageNum <= pages; pageNum++) {
       try {
@@ -212,24 +277,41 @@ export async function scrapeYad2(
         console.log(`[Yad2] Fetching page ${pageNum}/${pages}: ${url}`);
 
         await page.goto(url, {
-          waitUntil: 'networkidle2',
+          waitUntil: 'domcontentloaded',
           timeout: 30000,
         });
 
-        // Wait a moment for any dynamic content
-        await new Promise((r) => setTimeout(r, 2000));
+        // Wait for page to load
+        await new Promise((r) => setTimeout(r, 3000));
+
+        // Check for captcha
+        const captchaDetected = await hasCaptcha(page);
+        if (captchaDetected) {
+          await waitForCaptchaSolved(page);
+          captchaSolvedOnce = true;
+
+          // After captcha solved, the page should have reloaded
+          // Check if we're on the actual listings page now
+          const stillNeedNavigate = await hasCaptcha(page);
+          if (stillNeedNavigate) {
+            // Navigate again after captcha
+            await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await new Promise((r) => setTimeout(r, 3000));
+          }
+        }
+
+        // Wait for __NEXT_DATA__
+        try {
+          await page.waitForSelector('#__NEXT_DATA__', { timeout: 10000 });
+        } catch {
+          console.warn(`[Yad2] Page ${pageNum}: __NEXT_DATA__ not found after 10s`);
+        }
+
+        await new Promise((r) => setTimeout(r, 1000));
 
         const feed = await extractFeedFromPage(page);
         if (!feed) {
           console.warn(`[Yad2] Page ${pageNum}: No feed data found`);
-          // Take a screenshot for debugging
-          const screenshotPath = path.join(__dirname, '..', '..', 'data', `debug-page${pageNum}.png`);
-          try {
-            const dataDir = path.dirname(screenshotPath);
-            if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
-            await page.screenshot({ path: screenshotPath });
-            console.log(`[Yad2] Debug screenshot saved: ${screenshotPath}`);
-          } catch {}
           continue;
         }
 
@@ -239,7 +321,6 @@ export async function scrapeYad2(
           );
         }
 
-        // Collect from all categories
         const categories: (keyof Yad2FeedData)[] = [
           'private', 'agency', 'yad1', 'platinum',
           'trio', 'booster', 'leadingBroker', 'kingOfTheHar',
@@ -266,7 +347,7 @@ export async function scrapeYad2(
           `[Yad2] Page ${pageNum}: ${pageCount} new listings (${allListings.length} total)`
         );
 
-        // Rate limit between pages
+        // Rate limit
         if (pageNum < pages) {
           await new Promise((r) => setTimeout(r, 3000));
         }
@@ -282,7 +363,7 @@ export async function scrapeYad2(
     }
   }
 
-  // Geocode listings without coordinates (most Yad2 listings already have coords)
+  // Geocode listings without coordinates
   if (geocode) {
     const needGeocode = allListings.filter((l) => !l.lat || !l.lng);
     if (needGeocode.length > 0) {
