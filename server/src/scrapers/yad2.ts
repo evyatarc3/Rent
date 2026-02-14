@@ -120,12 +120,16 @@ function feedItemToListing(item: Yad2FeedItem): Listing | null {
     rooms: rooms || 0,
     floor: addr.house?.floor ?? undefined,
     size_sqm: item.additionalDetails?.squareMeter ?? undefined,
+    contact_name: undefined,
+    contact_phone: undefined,
     contact_info: `https://www.yad2.co.il/item/${item.token}`,
     description,
     image_url: imageUrl || undefined,
     source_url: `https://www.yad2.co.il/item/${item.token}`,
     lat: addr.coords?.lat || undefined,
     lng: addr.coords?.lon || undefined,
+    entry_date: undefined,
+    available_date: undefined,
   };
 }
 
